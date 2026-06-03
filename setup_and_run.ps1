@@ -1,13 +1,67 @@
-# setup_and_run.ps1 - One click setup for Z-Image Turbo (GGUF) with minimal UI
-# Place this file in ZImage-Windows and double-click start_zimage.bat to run.
+param(
+    [switch]$ResetSetup,
+    [switch]$AdvancedSetup,
+    [switch]$SetupOnly
+)
 
-Write-Host '=== Z-Image Turbo: One-Click (4/6/10GB) - Low VRAM UI ==='
-Write-Host ''
+$ErrorActionPreference = "Stop"
 
-# 0. Basic checks
-if (!(Get-Command python -ErrorAction SilentlyContinue)) {
-    Write-Host "ERROR: Python not found. Install Python 3.10+ from https://python.org and re-run."
-    exit 1
+Write-Host "=== Z-Image Turbo Windows ==="
+Write-Host ""
+
+$root = $PSScriptRoot
+$configDir = Join-Path $root "config"
+$registryPath = Join-Path $configDir "model_registry.json"
+$setupConfigPath = Join-Path $configDir "setup_config.json"
+$sdBin = Join-Path $root "sd_bin"
+$modelsDir = Join-Path $root "models"
+$zimageDir = Join-Path $modelsDir "zimage"
+$vaeDir = Join-Path $modelsDir "vae"
+$llmDir = Join-Path $modelsDir "llm"
+$loraDir = Join-Path $modelsDir "loras"
+$downloadsDir = Join-Path $root "downloads"
+$backendDownloadsDir = Join-Path $downloadsDir "backend"
+
+function Ensure-Dir {
+    param([string]$Path)
+    if (!(Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+}
+
+function Ensure-ProjectFolders {
+    Ensure-Dir $configDir
+    Ensure-Dir $sdBin
+    Ensure-Dir $modelsDir
+    Ensure-Dir $zimageDir
+    Ensure-Dir $vaeDir
+    Ensure-Dir $llmDir
+    Ensure-Dir $loraDir
+    Ensure-Dir $downloadsDir
+    Ensure-Dir $backendDownloadsDir
+}
+
+function Load-Registry {
+    if (!(Test-Path $registryPath)) {
+        throw "Missing model registry: $registryPath"
+    }
+    return Get-Content -Raw -Path $registryPath | ConvertFrom-Json
+}
+
+function Save-SetupConfig {
+    param([object]$Config)
+    $Config | ConvertTo-Json -Depth 8 | Out-File -Encoding utf8 $setupConfigPath
+}
+
+function Load-SetupConfig {
+    if (!(Test-Path $setupConfigPath)) {
+        return $null
+    }
+    try {
+        return Get-Content -Raw -Path $setupConfigPath | ConvertFrom-Json
+    } catch {
+        return $null
+    }
 }
 
 function Download-FileWithProgress {
@@ -18,289 +72,498 @@ function Download-FileWithProgress {
     )
 
     try {
-        # Hugging Face downloads can fail on older TLS defaults
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     } catch {
-        # ignore
     }
 
     $dir = Split-Path -Parent $Destination
-    if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    Ensure-Dir $dir
 
     try {
         $curlCmd = Get-Command curl.exe -ErrorAction SilentlyContinue
         if ($curlCmd -and $curlCmd.Source) {
-            $curl = $curlCmd.Source
-            Write-Host ("{0} - downloading via curl (with resume/retry)..." -f $Label)
-
+            Write-Host ("{0}..." -f $Label)
             $args = @(
-                '--location',
-                '--fail',
-                '--retry', '10',
-                '--retry-delay', '5',
-                '--retry-all-errors',
-                '--connect-timeout', '30',
-                '--speed-time', '30',
-                '--speed-limit', '10240',
-                '--progress-bar',
-                '--header', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                '--header', 'Accept: */*'
+                "--location",
+                "--fail",
+                "--retry", "10",
+                "--retry-delay", "5",
+                "--retry-all-errors",
+                "--connect-timeout", "30",
+                "--speed-time", "30",
+                "--speed-limit", "10240",
+                "--progress-bar",
+                "--header", "User-Agent: Mozilla/5.0",
+                "--header", "Accept: */*"
             )
-
             if (Test-Path $Destination) {
-                $args += @('--continue-at', '-')
+                $args += @("--continue-at", "-")
             }
-
-            $args += @('--output', $Destination, $Url)
-
-            & $curl @args
+            $args += @("--output", $Destination, $Url)
+            & $curlCmd.Source @args
             if ($LASTEXITCODE -ne 0) {
                 throw "curl failed with exit code $LASTEXITCODE"
             }
             return
         }
     } catch {
-        Write-Host "`nPrimary download method (curl) failed. Falling back..."
+        Write-Host "curl download failed, using fallback downloader."
         Write-Host ("Reason: {0}" -f $_.Exception.Message)
     }
 
+    $headers = @{
+        "User-Agent" = "Mozilla/5.0"
+        "Accept" = "*/*"
+    }
+    Invoke-WebRequest -Uri $Url -OutFile $Destination -Headers $headers -MaximumRedirection 10 -ProxyUseDefaultCredentials
+}
+
+function Verify-Sha256 {
+    param(
+        [string]$Path,
+        [string]$ExpectedSha256
+    )
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        return $true
+    }
+    $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $expected = $ExpectedSha256.Trim().ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "SHA256 mismatch for $Path. Expected $expected but got $actual"
+    }
+    return $true
+}
+
+function Get-NvidiaInfo {
+    $nvidiaSmi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+    if (!$nvidiaSmi) {
+        return $null
+    }
     try {
-        Write-Host ("{0} - downloading via Invoke-WebRequest (fallback)..." -f $Label)
-        $headers = @{
-            'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            'Accept' = '*/*'
+        $line = & $nvidiaSmi.Source --query-gpu=name,memory.total,compute_cap --format=csv,noheader,nounits 2>$null | Select-Object -First 1
+        if (!$line) {
+            return $null
         }
-        Invoke-WebRequest -Uri $Url -OutFile $Destination -Headers $headers -MaximumRedirection 10 -ProxyUseDefaultCredentials
-        return
+        $parts = $line -split ","
+        return [pscustomobject]@{
+            Vendor = "NVIDIA"
+            Name = $parts[0].Trim()
+            VramMb = [int]($parts[1].Trim())
+            ComputeCapability = $parts[2].Trim()
+            CudaAvailable = $true
+        }
     } catch {
-        $msg = $_.Exception.Message
-        try {
-            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-                $msg = "HTTP {0} - {1}" -f [int]$_.Exception.Response.StatusCode, $_.Exception.Response.StatusDescription
+        return $null
+    }
+}
+
+function Get-DisplayAdapters {
+    try {
+        return Get-CimInstance Win32_VideoController | ForEach-Object {
+            [pscustomobject]@{
+                Name = $_.Name
+                AdapterRAM = $_.AdapterRAM
             }
-        } catch {
-            # ignore
         }
-        throw $msg
+    } catch {
+        return @()
     }
 }
 
-# 1. Create folders
-$root = $PSScriptRoot
-$sdBin = Join-Path $root "sd_bin"
-$modelsDir = Join-Path $root "models"
-$zimageDir = Join-Path $modelsDir "zimage"
-$vaeDir = Join-Path $modelsDir "vae"
-$llmDir = Join-Path $modelsDir "llm"
-$loraDir = Join-Path $modelsDir "loras"
-if (!(Test-Path $sdBin)) { New-Item -ItemType Directory -Path $sdBin | Out-Null }
-if (!(Test-Path $modelsDir)) { New-Item -ItemType Directory -Path $modelsDir | Out-Null }
-if (!(Test-Path $zimageDir)) { New-Item -ItemType Directory -Path $zimageDir | Out-Null }
-if (!(Test-Path $vaeDir)) { New-Item -ItemType Directory -Path $vaeDir | Out-Null }
-if (!(Test-Path $llmDir)) { New-Item -ItemType Directory -Path $llmDir | Out-Null }
-if (!(Test-Path $loraDir)) { New-Item -ItemType Directory -Path $loraDir | Out-Null }
-
-Write-Host 'Folders prepared:'
-Write-Host (" - sd_bin  : {0}" -f $sdBin)
-Write-Host (" - models/zimage  : {0}" -f $zimageDir)
-Write-Host (" - models/vae  : {0}" -f $vaeDir)
-Write-Host (" - models/llm  : {0}" -f $llmDir)
-Write-Host ''
-
-# 2. Ask user about VRAM tier
-Write-Host 'Choose your GPU VRAM tier (pick the number):'
-Write-Host ' 1) 4 GB  (Fastest, smallest model, recommended for RTX 3050 4GB)'
-Write-Host ' 2) 6-8 GB  (Better quality)'
-Write-Host ' 3) 10+ GB  (Highest quality - not recommended for 4GB)'
-$choice = Read-Host 'Enter 1, 2 or 3'
-
-switch ($choice) {
-    "1" {
-        $moshort = "4GB"
-        $model_name = "z_image_turbo_Q4_0.gguf"
-        # Example public URL placeholder - replace if you prefer another source.
-        $model_url = "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q4_0.gguf"
+function Detect-Hardware {
+    $nvidia = Get-NvidiaInfo
+    if ($nvidia) {
+        return [pscustomobject]@{
+            Vendor = "NVIDIA"
+            Name = $nvidia.Name
+            VramMb = $nvidia.VramMb
+            ComputeCapability = $nvidia.ComputeCapability
+            CudaAvailable = $true
+            BackendKind = "cuda12"
+        }
     }
-    "2" {
-        $moshort = "6-8GB"
-        $model_name = "z_image_turbo_Q6_K.gguf"
-        $model_url = "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q6_K.gguf"
+
+    $adapters = @(Get-DisplayAdapters)
+    $adapterText = ($adapters | ForEach-Object { $_.Name }) -join "; "
+    if ($adapterText -match "AMD|Radeon") {
+        return [pscustomobject]@{
+            Vendor = "AMD"
+            Name = $adapterText
+            VramMb = 0
+            ComputeCapability = ""
+            CudaAvailable = $false
+            BackendKind = "cpu"
+        }
     }
-    "3" {
-        $moshort = "10+GB"
-        $model_name = "z_image_turbo_Q8_0.gguf"
-        $model_url = "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q8_0.gguf"
+    if ($adapterText -match "Intel|Arc") {
+        return [pscustomobject]@{
+            Vendor = "Intel"
+            Name = $adapterText
+            VramMb = 0
+            ComputeCapability = ""
+            CudaAvailable = $false
+            BackendKind = "cpu"
+        }
     }
-    default {
-        Write-Host "Invalid choice. Exiting."
+    return [pscustomobject]@{
+        Vendor = "CPU"
+        Name = "No supported dedicated GPU detected"
+        VramMb = 0
+        ComputeCapability = ""
+        CudaAvailable = $false
+        BackendKind = "cpu"
+    }
+}
+
+function Recommend-Profile {
+    param([object]$Hardware)
+    if ($Hardware.Vendor -eq "NVIDIA") {
+        if ($Hardware.VramMb -lt 6144) {
+            return "ultra_low_vram"
+        }
+        if ($Hardware.VramMb -lt 10240) {
+            return "balanced"
+        }
+        return "high_end"
+    }
+    return "cpu_only"
+}
+
+function Get-ModelByProfile {
+    param(
+        [object]$Registry,
+        [string]$ProfileId
+    )
+    $profile = $Registry.profiles.$ProfileId
+    $modelId = $profile.default_model
+    return [pscustomobject]@{
+        Id = $modelId
+        Model = $Registry.models.$modelId
+    }
+}
+
+function Find-BackendExe {
+    $sdCliExe = Join-Path $sdBin "sd-cli.exe"
+    $sdOldExe = Join-Path $sdBin "sd.exe"
+    if (Test-Path $sdCliExe) {
+        return $sdCliExe
+    }
+    if (Test-Path $sdOldExe) {
+        return $sdOldExe
+    }
+    return $null
+}
+
+function Get-LatestRelease {
+    $headers = @{ "User-Agent" = "ZImage-Windows-Setup" }
+    return Invoke-RestMethod -Uri "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest" -Headers $headers
+}
+
+function Get-AssetShaFromReleaseBody {
+    param(
+        [string]$Body,
+        [string]$AssetName
+    )
+    if ([string]::IsNullOrWhiteSpace($Body)) {
+        return ""
+    }
+    $escaped = [regex]::Escape($AssetName)
+    $pattern = "(?is)$escaped.*?sha256:\s*([a-f0-9]{64})"
+    $match = [regex]::Match($Body, $pattern)
+    if ($match.Success) {
+        return $match.Groups[1].Value
+    }
+    return ""
+}
+
+function Download-And-Extract-Asset {
+    param(
+        [object]$Release,
+        [string]$NamePattern,
+        [string]$Label
+    )
+    $asset = $Release.assets | Where-Object { $_.name -like $NamePattern } | Select-Object -First 1
+    if (!$asset) {
+        throw "Could not find release asset matching: $NamePattern"
+    }
+
+    $zipPath = Join-Path $backendDownloadsDir $asset.name
+    Download-FileWithProgress -Url $asset.browser_download_url -Destination $zipPath -Label $Label
+
+    $expectedSha = Get-AssetShaFromReleaseBody -Body $Release.body -AssetName $asset.name
+    if ($expectedSha) {
+        Verify-Sha256 -Path $zipPath -ExpectedSha256 $expectedSha | Out-Null
+        Write-Host "Verified SHA256: $($asset.name)"
+    } else {
+        Write-Host "SHA256 not found in release notes for $($asset.name); continuing after successful download."
+    }
+
+    $extractDir = Join-Path $backendDownloadsDir ([IO.Path]::GetFileNameWithoutExtension($asset.name))
+    if (Test-Path $extractDir) {
+        Remove-Item -Recurse -Force $extractDir
+    }
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+    return $extractDir
+}
+
+function Copy-BackendFiles {
+    param([string]$ExtractDir)
+    $files = Get-ChildItem -Path $ExtractDir -Recurse -File | Where-Object {
+        $_.Name -in @("sd-cli.exe", "sd-server.exe", "stable-diffusion.dll") -or $_.Extension -eq ".dll"
+    }
+    foreach ($file in $files) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $sdBin $file.Name) -Force
+    }
+}
+
+function Install-BackendAutomatically {
+    param([string]$BackendKind)
+    Write-Host ""
+    Write-Host "Installing stable-diffusion.cpp backend automatically..."
+    $release = Get-LatestRelease
+    if ($BackendKind -eq "cuda12") {
+        $cudaDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-cuda12-x64.zip" -Label "Downloading CUDA backend"
+        Copy-BackendFiles -ExtractDir $cudaDir
+        $runtimeDir = Download-And-Extract-Asset -Release $release -NamePattern "cudart-sd-bin-win-cu12-x64.zip" -Label "Downloading CUDA runtime DLLs"
+        Copy-BackendFiles -ExtractDir $runtimeDir
+    } else {
+        $cpuDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-avx2-x64.zip" -Label "Downloading CPU backend"
+        Copy-BackendFiles -ExtractDir $cpuDir
+    }
+}
+
+function Ensure-PythonEnvironment {
+    $venv = Join-Path $root "venv"
+    if (!(Test-Path $venv)) {
+        Write-Host "Creating Python virtual environment..."
+        python -m venv venv
+    } else {
+        Write-Host "Virtual environment already exists."
+    }
+
+    $venvPython = Join-Path $venv "Scripts\python.exe"
+    if (!(Test-Path $venvPython)) {
+        throw "venv python not found at $venvPython"
+    }
+
+    Write-Host "Installing/updating Python requirements..."
+    & $venvPython -m pip install --upgrade pip | Out-Host
+    & $venvPython -m pip install gradio requests tqdm pillow | Out-Host
+    return $venvPython
+}
+
+function Ensure-RegistryAsset {
+    param(
+        [object]$Asset,
+        [string]$DestinationDir,
+        [string]$Label
+    )
+    $destination = Join-Path $DestinationDir $Asset.filename
+    if (Test-Path $destination) {
+        Write-Host "$Label already exists: $destination"
+        return $destination
+    }
+    Download-FileWithProgress -Url $Asset.url -Destination $destination -Label ("Downloading {0}" -f $Label)
+    Verify-Sha256 -Path $destination -ExpectedSha256 $Asset.sha256 | Out-Null
+    Write-Host "Downloaded $Label to: $destination"
+    return $destination
+}
+
+function Test-SetupComplete {
+    param(
+        [object]$Config,
+        [object]$Registry
+    )
+    if (!$Config) {
+        return $false
+    }
+    if (!(Find-BackendExe)) {
+        return $false
+    }
+    $modelId = $Config.model_id
+    if (!$modelId) {
+        return $false
+    }
+    $model = $Registry.models.$modelId
+    if (!$model) {
+        return $false
+    }
+    $required = @(
+        (Join-Path $zimageDir $model.filename),
+        (Join-Path $vaeDir $Registry.models."z-image-vae".filename),
+        (Join-Path $llmDir $Registry.models."qwen-text-encoder-q4".filename)
+    )
+    foreach ($path in $required) {
+        if (!(Test-Path $path)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Run-SetupWizard {
+    param([object]$Registry)
+
+    Write-Host ""
+    Write-Host "First-time setup wizard"
+    Write-Host "This runs only when setup is incomplete or reset."
+    Write-Host ""
+
+    $hardware = Detect-Hardware
+    $recommendedProfile = Recommend-Profile -Hardware $hardware
+    $profile = $Registry.profiles.$recommendedProfile
+    $modelInfo = Get-ModelByProfile -Registry $Registry -ProfileId $recommendedProfile
+
+    Write-Host "Detected hardware:"
+    Write-Host (" - Vendor : {0}" -f $hardware.Vendor)
+    Write-Host (" - Device : {0}" -f $hardware.Name)
+    if ($hardware.VramMb -gt 0) {
+        Write-Host (" - VRAM   : {0:N1} GB" -f ($hardware.VramMb / 1024))
+    }
+    if ($hardware.ComputeCapability) {
+        Write-Host (" - Compute: {0}" -f $hardware.ComputeCapability)
+    }
+    Write-Host ""
+    Write-Host ("Recommended profile: {0} ({1})" -f $profile.display_name, $profile.target)
+    Write-Host ("Recommended model  : {0}" -f $modelInfo.Model.display_name)
+    Write-Host ""
+
+    $selectedProfile = $recommendedProfile
+    if ($AdvancedSetup) {
+        Write-Host "Advanced setup: choose a profile or press Enter to accept the recommendation."
+        Write-Host " 1) Ultra Low VRAM - 4GB GPUs"
+        Write-Host " 2) Balanced - 6-8GB GPUs"
+        Write-Host " 3) High-End - 10GB+ GPUs"
+        Write-Host " 4) CPU Only"
+        $profileChoice = Read-Host "Profile"
+        switch ($profileChoice) {
+            "1" { $selectedProfile = "ultra_low_vram" }
+            "2" { $selectedProfile = "balanced" }
+            "3" { $selectedProfile = "high_end" }
+            "4" { $selectedProfile = "cpu_only" }
+            default { $selectedProfile = $recommendedProfile }
+        }
+    } else {
+        Write-Host "Using the recommended profile automatically."
+    }
+
+    $modelInfo = Get-ModelByProfile -Registry $Registry -ProfileId $selectedProfile
+    $backendMode = "auto"
+    if ($AdvancedSetup) {
+        Write-Host ""
+        Write-Host "Backend installation:"
+        Write-Host " 1) Automatic download/install"
+        Write-Host " 2) Manual binaries in sd_bin"
+        $backendChoice = Read-Host "Choose 1 or 2"
+        if ($backendChoice -eq "2") {
+            $backendMode = "manual"
+        }
+    }
+
+    $backendExe = Find-BackendExe
+    if (!$backendExe -and $backendMode -eq "auto") {
+        Install-BackendAutomatically -BackendKind $hardware.BackendKind
+        $backendExe = Find-BackendExe
+    }
+    if (!$backendExe) {
+        Write-Host ""
+        Write-Host "No backend executable found."
+        Write-Host "Place sd-cli.exe or sd.exe in: $sdBin"
+        Write-Host "Then rerun start_zimage.bat."
         exit 1
     }
-}
 
-Write-Host ''
-Write-Host ("You picked: {0}" -f $moshort)
-Write-Host ("Model will be saved as: {0}" -f $model_name)
-Write-Host ''
+    $venvPython = Ensure-PythonEnvironment
+    $modelPath = Ensure-RegistryAsset -Asset $modelInfo.Model -DestinationDir $zimageDir -Label $modelInfo.Model.display_name
+    $vaePath = Ensure-RegistryAsset -Asset $Registry.models."z-image-vae" -DestinationDir $vaeDir -Label "Z-Image Turbo VAE"
+    $llmPath = Ensure-RegistryAsset -Asset $Registry.models."qwen-text-encoder-q4" -DestinationDir $llmDir -Label "Qwen text encoder"
 
-# 3. Create venv (if missing)
-$venv = Join-Path $root "venv"
-if (!(Test-Path $venv)) {
-    Write-Host "Creating Python virtual environment..."
-    python -m venv venv
-} else {
-    Write-Host "Virtual environment already exists (venv/)."
-}
+    $selectedModelPath = Join-Path $zimageDir "selected_model.txt"
+    $modelInfo.Model.filename | Out-File -Encoding ascii $selectedModelPath
 
-# 4. Use venv python directly (avoids PowerShell execution policy issues with Activate.ps1)
-$venvPython = Join-Path $venv "Scripts\python.exe"
-if (!(Test-Path $venvPython)) {
-    Write-Host "ERROR: venv python not found at: $venvPython"
-    exit 1
-}
-
-# 5. Upgrade pip safely
-Write-Host "Upgrading pip..."
-& $venvPython -m pip install --upgrade pip
-
-# 6. Install Python deps for minimal UI
-Write-Host 'Installing Python requirements (gradio, requests)...'
-& $venvPython -m pip install gradio requests tqdm
-
-# 7. Check for sd binary (sd-cli.exe or sd.exe)
-$sdCliExe = Join-Path $sdBin "sd-cli.exe"
-$sdOldExe = Join-Path $sdBin "sd.exe"
-
-if ((Test-Path $sdCliExe)) {
-    Write-Host "Found sd-cli.exe (recommended)"
-    $sdexe = $sdCliExe
-} elseif ((Test-Path $sdOldExe)) {
-    Write-Host "Found sd.exe (legacy)"
-    $sdexe = $sdOldExe
-} else {
-    Write-Host ""
-    Write-Host "IMPORTANT: A stable-diffusion.cpp Windows binary is REQUIRED to run the model."
-    Write-Host "Please download from the official stable-diffusion.cpp releases:"
-    Write-Host "    https://github.com/leejet/stable-diffusion.cpp/releases"
-    Write-Host ""
-    Write-Host "Recommended: Extract 'sd-cli.exe' (or 'sd.exe' from older releases) to:"
-    Write-Host "    $sdBin"
-    Write-Host ""
-    Write-Host "Note: Recent releases use 'sd-cli.exe'. Older releases use 'sd.exe'. Either will work."
-    Write-Host ""
-    Write-Host "Press Enter after you have placed the executable, or Ctrl+C to exit."
-    Read-Host
-}
-
-if (!(Test-Path $sdexe)) {
-    Write-Host "Executable still not found in $sdBin. Exiting."
-    exit 1
-}
-
-# 7b. Sanity-check executable (common crash is missing DLL / wrong build)
-Write-Host "`nChecking executable..."
-try {
-    & $sdexe --help | Out-Null
-} catch {
-    # swallow - we will check exit code below
-}
-if ($LASTEXITCODE -ne 0) {
-    Write-Host ""
-    Write-Host "ERROR: Executable failed to start (exit code: $LASTEXITCODE)."
-    Write-Host "This usually means a missing dependency or wrong build." 
-    Write-Host "" 
-    Write-Host "Please check:" 
-    Write-Host " 1) You extracted the release ZIP and copied the executable AND any .dll files into:"
-    Write-Host "    $sdBin"
-    Write-Host " 2) Microsoft Visual C++ Redistributable 2015-2022 (x64) is installed"
-    Write-Host " 3) If you downloaded a CUDA build, your NVIDIA driver supports that CUDA version"
-    Write-Host " 4) Try the CPU-only ZIP (sd-...-bin-win-x64.zip) to confirm it works on your PC"
-    Write-Host ""
-    Write-Host "Press Enter to exit."
-    Read-Host
-    exit 1
-}
-
-# 8. Download the chosen quantized GGUF model if it does not exist
-$dest = Join-Path $zimageDir $model_name
-if (Test-Path $dest) {
-    Write-Host "Model already exists: $dest"
-} else {
-    Write-Host "`nDownloading quantized model (this can be several GB)."
-    Write-Host "Source URL (if it fails, open link in browser and download manually):"
-    Write-Host "  $model_url`n"
-    try {
-        Download-FileWithProgress -Url $model_url -Destination $dest -Label ("Downloading Z-Image model: {0}" -f $model_name)
-        Write-Host "Downloaded model to: $dest"
-    } catch {
-        Write-Host "Automatic download failed. Please download the file manually and place it into:"
-        Write-Host "   $dest"
-        Write-Host "Then press Enter to continue."
-        Read-Host
-        if (!(Test-Path $dest)) {
-            Write-Host "Model not found. Exiting."
-            exit 1
+    $config = [ordered]@{
+        schema_version = 1
+        setup_complete = $true
+        created_at = (Get-Date).ToString("o")
+        updated_at = (Get-Date).ToString("o")
+        profile_id = $selectedProfile
+        model_id = $modelInfo.Id
+        backend_mode = $backendMode
+        backend_kind = $hardware.BackendKind
+        backend_path = $backendExe
+        venv_python = $venvPython
+        paths = [ordered]@{
+            model = $modelPath
+            vae = $vaePath
+            llm = $llmPath
+        }
+        hardware = [ordered]@{
+            vendor = $hardware.Vendor
+            name = $hardware.Name
+            vram_mb = $hardware.VramMb
+            compute_capability = $hardware.ComputeCapability
+            cuda_available = $hardware.CudaAvailable
+        }
+        preferences = [ordered]@{
+            launch_url = "http://127.0.0.1:9000"
         }
     }
+    Save-SetupConfig -Config $config
+    Write-Host ""
+    Write-Host "Setup complete. Future launches will start immediately."
+    return [pscustomobject]$config
 }
 
-# 9. Download VAE + LLM (required by Z-Image pipeline)
-$vaeName = "ae.safetensors"
-$vaeUrl = "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors"
-$vaePath = Join-Path $vaeDir $vaeName
-
-$llmName = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
-$llmUrl = "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
-$llmPath = Join-Path $llmDir $llmName
-
-if (Test-Path $vaePath) {
-    Write-Host "VAE already exists: $vaePath"
-} else {
-    Write-Host "`nVAE is required but may be restricted for non-logged-in downloads on Hugging Face."
-    Write-Host "Please download it manually (login may be required):"
-    Write-Host "  $vaeUrl"
-    Write-Host "Save it to:"
-    Write-Host "  $vaePath"
-    Write-Host "`nPress Enter after you have placed ae.safetensors, or Ctrl+C to exit."
-    Read-Host
-    if (!(Test-Path $vaePath)) {
-        Write-Host "VAE not found. Exiting."
-        exit 1
+function Launch-App {
+    param(
+        [object]$Config,
+        [object]$Registry
+    )
+    $model = $Registry.models.($Config.model_id)
+    if (!$model) {
+        throw "Configured model not found in registry: $($Config.model_id)"
     }
-}
+    $selectedModelPath = Join-Path $zimageDir "selected_model.txt"
+    $model.filename | Out-File -Encoding ascii $selectedModelPath
+    $env:ZIMAGE_MODEL_NAME = $model.filename
+    $env:ZIMAGE_PROFILE_ID = $Config.profile_id
 
-if (Test-Path $llmPath) {
-    Write-Host "LLM already exists: $llmPath"
-} else {
-    Write-Host "`nDownloading LLM (Qwen): $llmName"
-    Write-Host "Source URL (if it fails, open link in browser and download manually):"
-    Write-Host "  $llmUrl`n"
-    try {
-        Download-FileWithProgress -Url $llmUrl -Destination $llmPath -Label ("Downloading Qwen LLM: {0}" -f $llmName)
-        Write-Host "Downloaded LLM to: $llmPath"
-    } catch {
-        Write-Host "Automatic download failed. Please download the file manually and place it into:"
-        Write-Host "   $llmPath"
-        Write-Host "Then press Enter to continue."
-        Read-Host
-        if (!(Test-Path $llmPath)) {
-            Write-Host "LLM not found. Exiting."
-            exit 1
-        }
+    $venvPython = $Config.venv_python
+    if (!$venvPython -or !(Test-Path $venvPython)) {
+        $venvPython = Ensure-PythonEnvironment
+        $Config.venv_python = $venvPython
+        $Config.updated_at = (Get-Date).ToString("o")
+        Save-SetupConfig -Config $Config
     }
+
+    $uiScript = Join-Path $root "run_gradio_ui.py"
+    if (!(Test-Path $uiScript)) {
+        throw "run_gradio_ui.py not found."
+    }
+    Write-Host ""
+    Write-Host "Launching Z-Image Turbo UI..."
+    Write-Host ("Profile: {0}" -f $Config.profile_id)
+    Write-Host ("Model  : {0}" -f $model.filename)
+    Write-Host "URL    : http://127.0.0.1:9000"
+    & $venvPython $uiScript
 }
 
-# 10. Use the checked-in Gradio UI script
-$uiScript = Join-Path $root "run_gradio_ui.py"
-if (!(Test-Path $uiScript)) {
-    Write-Host "run_gradio_ui.py not found. Please make sure this file exists in the project folder."
-    exit 1
-}
-$env:ZIMAGE_MODEL_NAME = $model_name
-$selectedModelPath = Join-Path $zimageDir "selected_model.txt"
-$model_name | Out-File -Encoding ascii $selectedModelPath
-Write-Host "Using run_gradio_ui.py with model: $model_name"
-# 11. Run the UI
-Write-Host "`nStarting the minimal UI (Gradio) at http://127.0.0.1:9000"
-Write-Host "Press Ctrl+C in this window to stop."
-& $venvPython (Join-Path $root "run_gradio_ui.py")
+Ensure-ProjectFolders
+$registry = Load-Registry
 
+if ($ResetSetup -and (Test-Path $setupConfigPath)) {
+    Remove-Item -LiteralPath $setupConfigPath -Force
+}
+
+$config = Load-SetupConfig
+if (!(Test-SetupComplete -Config $config -Registry $registry)) {
+    $config = Run-SetupWizard -Registry $registry
+} else {
+    Write-Host "Setup already complete. Starting app."
+}
+
+if ($SetupOnly) {
+    Write-Host "Setup verification complete. Skipping app launch because -SetupOnly was used."
+} else {
+    Launch-App -Config $config -Registry $registry
+}

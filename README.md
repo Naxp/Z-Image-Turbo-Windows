@@ -17,7 +17,8 @@ Target users:
 - [Quickstart](#quickstart)
 - [Requirements](#requirements)
 - [Running the Setup](#running-the-setup)
-- [Why the Backend Files Are Manual](#why-the-backend-files-are-manual)
+- [Setup Wizard and Saved Configuration](#setup-wizard-and-saved-configuration)
+- [Why Backend Setup Is Hybrid](#why-backend-setup-is-hybrid)
 - [Where to Get the Executable (Windows)](#where-to-get-the-executable-windows)
 - [NVIDIA GPU / CUDA Notes](#nvidia-gpu--cuda-notes)
 - [Low VRAM Workflow](#low-vram-workflow)
@@ -32,21 +33,23 @@ Target users:
 ## Features
 
 - One-click installer: `start_zimage.bat`
+- First-run setup wizard that saves configuration and does not ask repeated questions
+- Automatic hardware detection and profile recommendation
 - Creates an isolated Python `venv` automatically
-- Downloads required model weights (GGUF) automatically
+- Downloads required model weights, VAE, and text encoder automatically
 - Gradio Web UI with prompt, resolution, seed tools, CFG, timer, stop button, and recent output gallery
 - Low VRAM presets for 4GB, 6-8GB, and 10GB+ NVIDIA workflows
 - LoRA support through `models\loras\`
 - Experimental img2img using stable-diffusion.cpp `--init-img` and `--strength`
 - Experimental inpainting using stable-diffusion.cpp `--init-img` and `--mask`
 - Example prompt presets for text-to-image, img2img, and inpainting
-- Safety-first: does **not** auto-download executables (`.exe`)
+- Hybrid backend setup: automatic for beginners, manual override for advanced users
 
 ## Quickstart
 
 1. Download / clone this repo.
-2. Put the stable-diffusion.cpp Windows files in `sd_bin\` (see instructions below).
-3. Double-click `start_zimage.bat`.
+2. Double-click `start_zimage.bat`.
+3. The first-run wizard installs missing files and saves configuration.
 4. Open the UI:
    - http://127.0.0.1:9000
 
@@ -67,19 +70,59 @@ Double-click:
 The installer will:
 
 - Create a Python virtual environment (`venv\`)
-- Ask you to choose a VRAM tier (4GB / 6-8GB / 10GB+)
-- Download the required weights
+- Detect your hardware
+- Recommend a profile automatically
+- Download required files
+- Save setup state in `config\setup_config.json`
 - Launch the Gradio UI at http://127.0.0.1:9000
+
+After setup is complete, future launches start the app directly.
+
+## Setup Wizard and Saved Configuration
+
+The setup now uses a two-stage flow:
+
+- First launch: runs the setup wizard, detects hardware, installs missing files, and saves configuration.
+- Normal launch: loads saved configuration and starts the app without asking setup questions again.
+
+Useful commands:
+
+```powershell
+.\setup_and_run.ps1
+.\setup_and_run.ps1 -AdvancedSetup
+.\setup_and_run.ps1 -ResetSetup
+.\setup_and_run.ps1 -SetupOnly
+```
+
+Most users do not need these commands. They are mainly for reset, setup verification, and advanced setup. The normal beginner flow is still double-clicking `start_zimage.bat`.
+
+Saved configuration:
+
+- `config\setup_config.json`
+
+Model registry:
+
+- `config\model_registry.json`
+
+The registry keeps model URLs and profile defaults outside the setup script so future models can be added more easily.
 
 Keep the terminal window open while it downloads models.
 
-## Why the backend files are manual
+## Why backend setup is hybrid
 
-This project **will never download executable (.exe) files automatically**.
+This project can now download stable-diffusion.cpp backend files automatically during beginner setup. Advanced users can still manage binaries manually.
 
 The app uses **stable-diffusion.cpp** as the inference backend. Older releases used one main executable named `sd.exe`. Newer releases split this into files such as `sd-cli.exe`, `sd-server.exe`, and `stable-diffusion.dll`.
 
 If you followed an older tutorial for this project that says to copy `sd.exe`, that was correct for the old stable-diffusion.cpp release. For current releases, use `sd-cli.exe` instead. The installer and UI will automatically detect either `sd-cli.exe` or legacy `sd.exe`.
+
+Beginner mode:
+
+- Automatically downloads the recommended stable-diffusion.cpp backend when missing.
+
+Advanced mode:
+
+- Allows manual backend placement in `sd_bin\`.
 
 ## Where to get the executable (Windows)
 
@@ -221,14 +264,14 @@ Manual:
   - CUDA runtime DLLs from `cudart-sd-bin-win-cu12-x64.zip`
   - Legacy builds: `sd.exe`
 - VAE: `models\vae\ae.safetensors`
-  - This file may require a Hugging Face login, so the installer asks you to download it manually.
+  - The installer now downloads this automatically from the Z-Image Turbo VAE mirror.
 
 Manual download sources:
 
 - Z-Image Turbo GGUF:
   - https://huggingface.co/leejet/Z-Image-Turbo-GGUF/tree/main
 - VAE (`ae.safetensors`):
-  - https://huggingface.co/black-forest-labs/FLUX.1-schnell/tree/main
+  - https://huggingface.co/airesearch-official/z-image-turbo-vae/tree/main
 - Qwen GGUF:
   - https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/tree/main
 

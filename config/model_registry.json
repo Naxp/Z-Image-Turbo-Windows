@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "models": {
+    "z-image-turbo-q4": {
+      "display_name": "Z-Image Turbo Q4_0",
+      "type": "diffusion",
+      "filename": "z_image_turbo_Q4_0.gguf",
+      "url": "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q4_0.gguf",
+      "sha256": "",
+      "recommended_profile": "ultra_low_vram",
+      "approx_size_gb": 3.5
+    },
+    "z-image-turbo-q6": {
+      "display_name": "Z-Image Turbo Q6_K",
+      "type": "diffusion",
+      "filename": "z_image_turbo_Q6_K.gguf",
+      "url": "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q6_K.gguf",
+      "sha256": "",
+      "recommended_profile": "balanced",
+      "approx_size_gb": 4.5
+    },
+    "z-image-turbo-q8": {
+      "display_name": "Z-Image Turbo Q8_0",
+      "type": "diffusion",
+      "filename": "z_image_turbo_Q8_0.gguf",
+      "url": "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q8_0.gguf",
+      "sha256": "",
+      "recommended_profile": "high_end",
+      "approx_size_gb": 6.0
+    },
+    "z-image-vae": {
+      "display_name": "Z-Image Turbo VAE",
+      "type": "vae",
+      "filename": "ae.safetensors",
+      "url": "https://huggingface.co/airesearch-official/z-image-turbo-vae/resolve/main/ae.safetensors",
+      "sha256": "",
+      "recommended_profile": "all",
+      "approx_size_gb": 0.32
+    },
+    "qwen-text-encoder-q4": {
+      "display_name": "Qwen Text Encoder Q4_K_M",
+      "type": "llm",
+      "filename": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+      "sha256": "",
+      "recommended_profile": "all",
+      "approx_size_gb": 2.4
+    }
+  },
+  "profiles": {
+    "ultra_low_vram": {
+      "display_name": "Ultra Low VRAM",
+      "target": "4GB GPUs",
+      "default_model": "z-image-turbo-q4"
+    },
+    "balanced": {
+      "display_name": "Balanced",
+      "target": "6-8GB GPUs",
+      "default_model": "z-image-turbo-q6"
+    },
+    "high_end": {
+      "display_name": "High-End",
+      "target": "10GB+ GPUs",
+      "default_model": "z-image-turbo-q8"
+    },
+    "cpu_only": {
+      "display_name": "CPU Only",
+      "target": "No compatible GPU detected",
+      "default_model": "z-image-turbo-q4"
+    }
+  }
+}

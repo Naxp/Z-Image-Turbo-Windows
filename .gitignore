@@ -56,5 +56,11 @@ Thumbs.db
 *.log
 logs.txt
 
+# Local setup state
+config/setup_config.json
+clean_test_install/
+ZImage-Windows-Clean-Test/
+prepare_clean_test_copy.*
+
 # Documentation
 AGENTS.md
