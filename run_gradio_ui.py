@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
+from gradio import Brush, Eraser
 from PIL import Image, ImageOps
 
 
@@ -21,7 +22,7 @@ if not MODEL_NAME:
 MODEL_PATH = str(ROOT / "models" / "zimage" / MODEL_NAME)
 LORA_DIR = ROOT / "models" / "loras"
 OUTDIR = ROOT / "outputs"
-TEMP_INPUT_DIR = ROOT / "tmp_inputs"
+TEMP_INPUT_DIR = OUTDIR / "_tmp_inputs"
 
 DEFAULT_VAE_PATH = str(ROOT / "models" / "vae" / "ae.safetensors")
 DEFAULT_LLM_PATH = str(ROOT / "models" / "llm" / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
@@ -33,6 +34,8 @@ TEMP_INPUT_DIR.mkdir(exist_ok=True)
 current_proc = None
 FIRST_RUN = True
 LAST_SEED = None
+LAST_IMG2IMG_SEED = None
+LAST_INPAINT_SEED = None
 
 RES_PRESETS = [
     ("1:1 (256x256)", 256, 256),
@@ -58,6 +61,26 @@ VRAM_PRESETS = [
     "10GB+ (fastest)",
 ]
 LORA_APPLY_MODES = ["auto", "immediately", "at_runtime"]
+TXT2IMG_PROMPTS = {
+    "Portrait": "cinematic portrait of a woman in a red dress inside a cozy cafe, soft window light, natural skin texture, 35mm photo",
+    "Product": "premium product photo of a matte black wireless speaker on a clean desk, softbox lighting, sharp details, commercial photography",
+    "Landscape": "wide landscape photo of a misty mountain valley at sunrise, dramatic light, realistic atmosphere, high detail",
+    "Fantasy": "fantasy castle above a glowing forest, epic scale, detailed architecture, cinematic lighting",
+    "Anime": "anime character portrait, expressive eyes, detailed hair, clean line art, soft color palette",
+    "Cinematic": "cinematic scene of a lone explorer standing in a neon-lit rainy street, film still, dramatic composition",
+}
+IMG2IMG_PROMPTS = {
+    "Color edit": "Change only the main subject color while preserving the same shape, lighting, background, and composition",
+    "Style shift": "Transform this image into a cinematic film still while preserving the subject and composition",
+    "Product polish": "Make this look like a premium studio product photo, clean lighting, sharp details, same object",
+    "Anime style": "Convert this image to a polished anime style while preserving the pose and composition",
+}
+INPAINT_PROMPTS = {
+    "Replace object": "Replace the masked area with a realistic object that matches the original lighting and perspective",
+    "Change clothing": "Change only the masked clothing color and fabric while preserving the person, pose, and background",
+    "Remove object": "Fill the masked area naturally using the surrounding background",
+    "Add detail": "Add realistic detail inside the masked area while matching the original image style",
+}
 
 
 def find_sd_executable():
@@ -107,6 +130,18 @@ def reuse_last_seed():
     return LAST_SEED
 
 
+def reuse_last_img2img_seed():
+    if LAST_IMG2IMG_SEED is None:
+        return gr.update()
+    return LAST_IMG2IMG_SEED
+
+
+def reuse_last_inpaint_seed():
+    if LAST_INPAINT_SEED is None:
+        return gr.update()
+    return LAST_INPAINT_SEED
+
+
 def refresh_loras():
     return gr.update(choices=get_lora_list())
 
@@ -115,11 +150,33 @@ def refresh_gallery():
     return get_recent_outputs()
 
 
+def apply_example(prompt_map, selected_label):
+    if selected_label in prompt_map:
+        return prompt_map[selected_label]
+    return gr.update()
+
+
+def apply_txt2img_example(selected_label):
+    return apply_example(TXT2IMG_PROMPTS, selected_label)
+
+
+def apply_img2img_example(selected_label):
+    return apply_example(IMG2IMG_PROMPTS, selected_label)
+
+
+def apply_inpaint_example(selected_label):
+    return apply_example(INPAINT_PROMPTS, selected_label)
+
+
 def set_unlocked(enabled):
     return gr.update(interactive=bool(enabled)), gr.update(interactive=bool(enabled))
 
 
 def set_img2img_enabled(enabled):
+    return gr.update(interactive=bool(enabled)), gr.update(interactive=bool(enabled))
+
+
+def set_inpaint_enabled(enabled):
     return gr.update(interactive=bool(enabled)), gr.update(interactive=bool(enabled))
 
 
@@ -189,6 +246,48 @@ def prepare_init_image(init_image_path, width, height):
         return None, f"Could not prepare img2img input image: {exc}"
 
 
+def get_editor_background(editor_value):
+    if not editor_value:
+        return None
+    if isinstance(editor_value, dict):
+        return editor_value.get("background") or editor_value.get("composite")
+    return editor_value
+
+
+def prepare_inpaint_images(editor_value, width, height):
+    if not editor_value:
+        return None, None, "Upload an image and paint a mask before using inpainting."
+
+    background = get_editor_background(editor_value)
+    if background is None:
+        return None, None, "Inpaint source image is missing."
+
+    try:
+        image = ImageOps.exif_transpose(background).convert("RGB")
+        layers = editor_value.get("layers", []) if isinstance(editor_value, dict) else []
+        mask = Image.new("L", image.size, 0)
+        for layer in layers:
+            layer_img = ImageOps.exif_transpose(layer).convert("RGBA")
+            alpha = layer_img.getchannel("A")
+            mask = Image.composite(Image.new("L", image.size, 255), mask, alpha)
+
+        if not mask.getbbox():
+            return None, None, "Paint over the area you want to edit before generating."
+
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
+            mask = mask.resize((width, height), Image.Resampling.NEAREST)
+
+        uid = uuid.uuid4().hex[:8]
+        init_dest = TEMP_INPUT_DIR / f"inpaint_init_{uid}.png"
+        mask_dest = TEMP_INPUT_DIR / f"inpaint_mask_{uid}.png"
+        image.save(init_dest)
+        mask.save(mask_dest)
+        return str(init_dest.absolute()), str(mask_dest.absolute()), None
+    except Exception as exc:
+        return None, None, f"Could not prepare inpaint image/mask: {exc}"
+
+
 def format_command(cmd):
     return subprocess.list2cmdline([str(part) for part in cmd])
 
@@ -225,9 +324,13 @@ def gen_image(
     vram_mode,
     clip_on_cpu,
     balanced_vae_tiling,
+    negative_prompt,
+    guidance,
     img2img_enabled,
     init_image_path,
     img2img_strength,
+    mask_path=None,
+    generation_mode="txt2img",
 ):
     global current_proc
 
@@ -235,17 +338,20 @@ def gen_image(
         yield None, "Error: No stable-diffusion executable found.", "", ""
         return
 
-    if img2img_enabled and not init_image_path:
-        yield None, "Img2img is enabled, but no input image was uploaded.", "0s", ""
+    uses_input_image = img2img_enabled or generation_mode == "inpaint"
+    if uses_input_image and not init_image_path:
+        yield None, f"{generation_mode} is enabled, but no input image was provided.", "0s", ""
         return
 
     init_file = None
     init_error = None
-    if img2img_enabled:
+    if generation_mode == "inpaint":
+        init_file = init_image_path
+    elif img2img_enabled:
         init_file, init_error = prepare_init_image(init_image_path, width, height)
-        if init_error:
-            yield None, init_error, "0s", ""
-            return
+    if init_error:
+        yield None, init_error, "0s", ""
+        return
 
     uid = uuid.uuid4().hex[:8]
     out_file = str((OUTDIR / f"out_{uid}.png").absolute())
@@ -265,6 +371,8 @@ def gen_image(
         lora_apply_mode,
         "-p",
         final_prompt,
+        "--guidance",
+        str(guidance),
         "--cfg-scale",
         str(cfg_scale),
         "--steps",
@@ -280,10 +388,14 @@ def gen_image(
         "--rng",
         "cuda",
     ]
+    if negative_prompt:
+        cmd.extend(["--negative-prompt", negative_prompt])
     cmd.extend(low_vram_flags(vram_mode, clip_on_cpu, balanced_vae_tiling))
 
-    if img2img_enabled:
+    if uses_input_image:
         cmd.extend(["--init-img", init_file, "--strength", str(img2img_strength)])
+    if generation_mode == "inpaint":
+        cmd.extend(["--mask", mask_path])
 
     cmd_str = format_command(cmd)
     yield None, f"Starting generation...\nCommand: {cmd_str}", "0s", cmd_str
@@ -334,7 +446,7 @@ def gen_image(
     write_metadata(
         out_file,
         {
-            "mode": "img2img" if img2img_enabled else "txt2img",
+            "mode": generation_mode,
             "prompt": prompt,
             "final_prompt": final_prompt,
             "seed": seed,
@@ -342,12 +454,15 @@ def gen_image(
             "height": height,
             "steps": steps,
             "cfg_scale": cfg_scale,
+            "guidance": guidance,
+            "negative_prompt": negative_prompt,
             "vram_mode": vram_mode,
             "lora_files": ", ".join(selected_loras or []),
             "lora_strength": lora_strength,
             "lora_apply_mode": lora_apply_mode,
             "init_image": init_file,
-            "img2img_strength": img2img_strength if img2img_enabled else None,
+            "mask": mask_path,
+            "strength": img2img_strength if uses_input_image else None,
             "command": cmd_str,
             "generation_time": total_time,
             "log": full_log.strip(),
@@ -363,11 +478,18 @@ with gr.Blocks() as demo:
         with gr.Column(scale=3):
             with gr.Tabs():
                 with gr.Tab("Basic"):
-                    prompt = gr.Textbox(
-                        label="Prompt",
+                    txt2img_prompt = gr.Textbox(
+                        label="Text-to-image prompt",
                         value="A large orange octopus on an ocean floor, cinematic, 8k",
                         lines=3,
                     )
+                    with gr.Row():
+                        txt2img_example = gr.Dropdown(
+                            list(TXT2IMG_PROMPTS.keys()),
+                            value="Portrait",
+                            label="Example Prompt",
+                        )
+                        txt2img_example_btn = gr.Button("Use Example", variant="secondary")
 
                     with gr.Row():
                         preset = gr.Dropdown(
@@ -421,7 +543,27 @@ with gr.Blocks() as demo:
 
                 with gr.Tab("Experimental Img2Img"):
                     gr.Markdown(
+                        "Creates a variation of the uploaded image. Higher strength values produce larger changes."
+                    )
+                    gr.Markdown(
                         "Experimental for Z-Image Turbo GGUF; results depend on backend support."
+                    )
+                    img2img_prompt = gr.Textbox(
+                        label="Img2Img prompt",
+                        value="Transform this image while preserving the main composition",
+                        lines=3,
+                    )
+                    with gr.Row():
+                        img2img_example = gr.Dropdown(
+                            list(IMG2IMG_PROMPTS.keys()),
+                            value="Color edit",
+                            label="Example Prompt",
+                        )
+                        img2img_example_btn = gr.Button("Use Example", variant="secondary")
+                    img2img_negative_prompt = gr.Textbox(
+                        label="Img2Img negative prompt",
+                        value="",
+                        lines=2,
                     )
                     img2img_enabled = gr.Checkbox(value=False, label="Enable img2img")
                     init_image = gr.Image(
@@ -429,12 +571,85 @@ with gr.Blocks() as demo:
                         type="filepath",
                         interactive=False,
                     )
+                    with gr.Row():
+                        img2img_seed = gr.Number(value=-1, precision=0, label="Img2Img Seed (-1 = random)")
+                    with gr.Row():
+                        img2img_random_seed_btn = gr.Button("Random Img2Img Seed", variant="secondary")
+                        img2img_reuse_seed_btn = gr.Button("Reuse Last Img2Img Seed", variant="secondary")
+                    with gr.Row():
+                        img2img_steps = gr.Slider(
+                            4,
+                            30,
+                            value=12,
+                            step=1,
+                            label="Img2Img Steps",
+                            info="More steps give the prompt more chances to affect the uploaded image.",
+                        )
+                        img2img_guidance = gr.Slider(
+                            1.0,
+                            8.0,
+                            value=3.5,
+                            step=0.1,
+                            label="Img2Img Guidance",
+                            info="Higher values follow the prompt more strongly, but can create more drift.",
+                        )
                     img2img_strength = gr.Slider(
                         0.1,
                         1.0,
-                        value=0.6,
+                        value=0.55,
                         step=0.05,
                         label="Img2Img Strength",
+                        info="Lower preserves more. Higher changes more. Z-Image usually needs about 0.50-0.60 for visible edits.",
+                        interactive=False,
+                    )
+
+                with gr.Tab("Inpaint / Selective Edit"):
+                    gr.Markdown(
+                        "Edit only selected regions while preserving the rest of the image. Experimental with Z-Image Turbo."
+                    )
+                    inpaint_enabled = gr.Checkbox(value=False, label="Enable inpainting")
+                    inpaint_editor = gr.ImageEditor(
+                        label="Source image and mask",
+                        type="pil",
+                        image_mode="RGBA",
+                        brush=Brush(default_size=32, colors=["#ffffff"], default_color="#ffffff", color_mode="fixed"),
+                        eraser=Eraser(default_size=32),
+                        layers=True,
+                        interactive=False,
+                        height=420,
+                    )
+                    inpaint_prompt = gr.Textbox(
+                        label="Inpaint prompt",
+                        value="Replace the masked area while matching the original lighting and style",
+                        lines=3,
+                    )
+                    with gr.Row():
+                        inpaint_example = gr.Dropdown(
+                            list(INPAINT_PROMPTS.keys()),
+                            value="Replace object",
+                            label="Example Prompt",
+                        )
+                        inpaint_example_btn = gr.Button("Use Example", variant="secondary")
+                    inpaint_negative_prompt = gr.Textbox(
+                        label="Inpaint negative prompt",
+                        value="",
+                        lines=2,
+                    )
+                    with gr.Row():
+                        inpaint_seed = gr.Number(value=-1, precision=0, label="Inpaint Seed (-1 = random)")
+                    with gr.Row():
+                        inpaint_random_seed_btn = gr.Button("Random Inpaint Seed", variant="secondary")
+                        inpaint_reuse_seed_btn = gr.Button("Reuse Last Inpaint Seed", variant="secondary")
+                    with gr.Row():
+                        inpaint_steps = gr.Slider(4, 30, value=12, step=1, label="Inpaint Steps")
+                        inpaint_guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.1, label="Inpaint Guidance")
+                    inpaint_strength = gr.Slider(
+                        0.1,
+                        1.0,
+                        value=0.75,
+                        step=0.05,
+                        label="Inpaint Strength",
+                        info="Higher values make the masked area change more.",
                         interactive=False,
                     )
 
@@ -458,18 +673,28 @@ with gr.Blocks() as demo:
 
     preset.change(apply_preset, inputs=[preset], outputs=[width, height])
     refresh_btn.click(refresh_loras, outputs=[lora_list])
+    txt2img_example_btn.click(apply_txt2img_example, inputs=[txt2img_example], outputs=[txt2img_prompt])
+    img2img_example_btn.click(apply_img2img_example, inputs=[img2img_example], outputs=[img2img_prompt])
+    inpaint_example_btn.click(apply_inpaint_example, inputs=[inpaint_example], outputs=[inpaint_prompt])
     random_seed_btn.click(random_seed, outputs=[seed])
     reuse_seed_btn.click(reuse_last_seed, outputs=[seed])
+    img2img_random_seed_btn.click(random_seed, outputs=[img2img_seed])
+    img2img_reuse_seed_btn.click(reuse_last_img2img_seed, outputs=[img2img_seed])
+    inpaint_random_seed_btn.click(random_seed, outputs=[inpaint_seed])
+    inpaint_reuse_seed_btn.click(reuse_last_inpaint_seed, outputs=[inpaint_seed])
     refresh_gallery_btn.click(refresh_gallery, outputs=[gallery])
     unlock.change(set_unlocked, inputs=[unlock], outputs=[vae_path, llm_path])
     img2img_enabled.change(set_img2img_enabled, inputs=[img2img_enabled], outputs=[init_image, img2img_strength])
+    inpaint_enabled.change(set_inpaint_enabled, inputs=[inpaint_enabled], outputs=[inpaint_editor, inpaint_strength])
 
     def run_and_return(
-        p,
+        txt_prompt,
+        image_prompt,
+        selective_prompt,
         w,
         h,
         st,
-        sd,
+        txt_seed,
         cfg,
         vae,
         llm,
@@ -481,14 +706,59 @@ with gr.Blocks() as demo:
         use_balanced_vae_tiling,
         use_img2img,
         input_image,
-        strength,
+        image_negative_prompt,
+        image_seed,
+        image_steps,
+        image_guidance,
+        image_strength,
+        use_inpaint,
+        inpaint_image,
+        selective_negative_prompt,
+        selective_seed,
+        selective_steps,
+        selective_guidance,
+        selective_strength,
     ):
-        global FIRST_RUN, LAST_SEED
+        global FIRST_RUN, LAST_SEED, LAST_IMG2IMG_SEED, LAST_INPAINT_SEED
 
-        run_seed = normalize_seed(sd)
-        LAST_SEED = run_seed
+        generation_mode = "inpaint" if use_inpaint else "img2img" if use_img2img else "txt2img"
+        if generation_mode == "inpaint":
+            run_seed = normalize_seed(selective_seed)
+            LAST_INPAINT_SEED = run_seed
+            seed_outputs = (gr.update(), gr.update(), run_seed)
+        elif generation_mode == "img2img":
+            run_seed = normalize_seed(image_seed)
+            LAST_IMG2IMG_SEED = run_seed
+            seed_outputs = (gr.update(), run_seed, gr.update())
+        else:
+            run_seed = normalize_seed(txt_seed)
+            LAST_SEED = run_seed
+            seed_outputs = (run_seed, gr.update(), gr.update())
+
         status_msg = "Generating... (first run can take longer)" if FIRST_RUN else "Generating..."
         FIRST_RUN = False
+        active_prompt = selective_prompt if generation_mode == "inpaint" else image_prompt if generation_mode == "img2img" else txt_prompt
+        active_steps = int(selective_steps) if generation_mode == "inpaint" else int(image_steps) if generation_mode == "img2img" else int(st)
+        active_negative_prompt = selective_negative_prompt if generation_mode == "inpaint" else image_negative_prompt if generation_mode == "img2img" else ""
+        active_guidance = float(selective_guidance) if generation_mode == "inpaint" else float(image_guidance) if generation_mode == "img2img" else 3.5
+        active_strength = float(selective_strength) if generation_mode == "inpaint" else float(image_strength)
+        active_init_image = input_image
+        active_mask = None
+        prep_error = None
+        if generation_mode == "inpaint":
+            active_init_image, active_mask, prep_error = prepare_inpaint_images(inpaint_image, int(w), int(h))
+            if prep_error:
+                yield (
+                    None,
+                    prep_error,
+                    gr.update(interactive=True),
+                    gr.update(interactive=False),
+                    "Generation Time: **0s**",
+                    "",
+                    get_recent_outputs(),
+                    *seed_outputs,
+                )
+                return
 
         yield (
             None,
@@ -498,7 +768,7 @@ with gr.Blocks() as demo:
             "Generation Time: **0s**",
             "",
             get_recent_outputs(),
-            run_seed,
+            *seed_outputs,
         )
 
         last_img = None
@@ -506,10 +776,10 @@ with gr.Blocks() as demo:
         last_time = "0s"
         last_command = ""
         for out_img, log, time_str, cmd_str in gen_image(
-            p,
+            active_prompt,
             int(w),
             int(h),
-            int(st),
+            active_steps,
             run_seed,
             float(cfg),
             vae,
@@ -520,9 +790,13 @@ with gr.Blocks() as demo:
             low_vram_mode,
             keep_clip_cpu,
             use_balanced_vae_tiling,
-            use_img2img,
-            input_image,
-            strength,
+            active_negative_prompt,
+            active_guidance,
+            generation_mode != "txt2img",
+            active_init_image,
+            active_strength,
+            active_mask,
+            generation_mode,
         ):
             if out_img is not None:
                 last_img = out_img
@@ -538,7 +812,7 @@ with gr.Blocks() as demo:
                 f"Generation Time: **{time_str}**",
                 cmd_str,
                 get_recent_outputs(),
-                run_seed,
+                *seed_outputs,
             )
 
         final_image = last_img if last_img is not None else gr.update()
@@ -550,13 +824,15 @@ with gr.Blocks() as demo:
             f"Generation Time: **{last_time}**",
             last_command,
             get_recent_outputs(),
-            run_seed,
+            *seed_outputs,
         )
 
     btn.click(
         run_and_return,
         inputs=[
-            prompt,
+            txt2img_prompt,
+            img2img_prompt,
+            inpaint_prompt,
             width,
             height,
             steps,
@@ -572,9 +848,31 @@ with gr.Blocks() as demo:
             balanced_vae_tiling,
             img2img_enabled,
             init_image,
+            img2img_negative_prompt,
+            img2img_seed,
+            img2img_steps,
+            img2img_guidance,
             img2img_strength,
+            inpaint_enabled,
+            inpaint_editor,
+            inpaint_negative_prompt,
+            inpaint_seed,
+            inpaint_steps,
+            inpaint_guidance,
+            inpaint_strength,
         ],
-        outputs=[img, status, btn, stop_btn, timer_display, command_box, gallery, seed],
+        outputs=[
+            img,
+            status,
+            btn,
+            stop_btn,
+            timer_display,
+            command_box,
+            gallery,
+            seed,
+            img2img_seed,
+            inpaint_seed,
+        ],
     )
     stop_btn.click(stop_gen, outputs=[status])
 

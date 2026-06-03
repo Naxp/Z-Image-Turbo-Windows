@@ -23,6 +23,7 @@ Target users:
 - [Low VRAM Workflow](#low-vram-workflow)
 - [LoRA Support](#lora-support)
 - [Experimental Img2Img](#experimental-img2img)
+- [Experimental Inpainting](#experimental-inpainting)
 - [Downloads](#what-the-installer-downloads-and-what-is-manual)
 - [Manual Download Sources](#manual-download-sources)
 - [Troubleshooting](#troubleshooting)
@@ -37,6 +38,8 @@ Target users:
 - Low VRAM presets for 4GB, 6-8GB, and 10GB+ NVIDIA workflows
 - LoRA support through `models\loras\`
 - Experimental img2img using stable-diffusion.cpp `--init-img` and `--strength`
+- Experimental inpainting using stable-diffusion.cpp `--init-img` and `--mask`
+- Example prompt presets for text-to-image, img2img, and inpainting
 - Safety-first: does **not** auto-download executables (`.exe`)
 
 ## Quickstart
@@ -175,14 +178,34 @@ The UI includes an **Experimental Img2Img** tab. This uses stable-diffusion.cpp 
 To try it:
 
 1. Enable img2img in the tab.
-2. Upload an input image.
-3. Set the strength:
-   - `0.3` keeps the source image strongly.
-   - `0.6` is a balanced transformation.
-   - `0.85` mostly regenerates the image.
-4. Generate as usual.
+2. Write the img2img prompt in that tab.
+3. Upload an input image.
+4. Set img2img steps, guidance, and strength:
+   - `0.30-0.45` preserves strongly and may show little change.
+   - `0.50-0.60` is a better practical range for visible Z-Image Turbo edits.
+   - `0.65+` can drift heavily or become a new image.
+5. Generate as usual.
 
-The app copies and resizes the uploaded image into a local temp folder before generation so the backend can read it reliably. Img2img support depends on the installed stable-diffusion.cpp build and Z-Image Turbo GGUF behavior, so it is labeled experimental.
+For small edits such as color changes, use the negative prompt to block unwanted scene changes such as `tree`, `branch`, or `outdoor`. The app copies and resizes the uploaded image into a local temp folder before generation so the backend can read it reliably. Img2img support depends on the installed stable-diffusion.cpp build and Z-Image Turbo GGUF behavior, so it is labeled experimental.
+
+## Experimental Inpainting
+
+The UI includes an **Inpaint / Selective Edit** tab. This uses stable-diffusion.cpp options:
+
+- `--init-img`
+- `--mask`
+- `--strength`
+
+To try it:
+
+1. Enable inpainting.
+2. Upload a source image in the editor.
+3. Paint over the area you want to edit.
+4. Write the inpaint prompt and optional negative prompt.
+5. Set steps, guidance, strength, and seed.
+6. Generate as usual.
+
+This is experimental with Z-Image Turbo. The backend accepts the mask path, but Z-Image Turbo is not a dedicated Photoshop-style inpainting model, so results may behave like masked img2img rather than perfect local edits.
 
 ## What the installer downloads (and what is manual)
 
