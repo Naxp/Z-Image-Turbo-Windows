@@ -22,6 +22,7 @@ Target users:
 - [Where to Get the Executable (Windows)](#where-to-get-the-executable-windows)
 - [NVIDIA GPU / CUDA Notes](#nvidia-gpu--cuda-notes)
 - [Low VRAM Workflow](#low-vram-workflow)
+- [Generation Queue](#generation-queue)
 - [LoRA Support](#lora-support)
 - [Experimental Img2Img](#experimental-img2img)
 - [Experimental Inpainting](#experimental-inpainting)
@@ -38,11 +39,14 @@ Target users:
 - Creates an isolated Python `venv` automatically
 - Downloads required model weights, VAE, and text encoder automatically
 - Gradio Web UI with prompt, resolution, seed tools, CFG, timer, stop button, and recent output gallery
+- Background generation queue: add new prompts while another image is still generating
+- Queue status table with running, queued, done, failed, stopped, and stopping states
 - Low VRAM presets for 4GB, 6-8GB, and 10GB+ NVIDIA workflows
 - LoRA support through `models\loras\`
-- Experimental img2img using stable-diffusion.cpp `--init-img` and `--strength`
+- Experimental img2img using stable-diffusion.cpp `--init-img` and `--strength`, with dedicated output-size controls
 - Experimental inpainting using stable-diffusion.cpp `--init-img` and `--mask`
 - Example prompt presets for text-to-image, img2img, and inpainting
+- Ready-link launcher: the URL is shown only after the local Gradio server responds
 - Hybrid backend setup: automatic for beginners, manual override for advanced users
 
 ## Quickstart
@@ -50,7 +54,8 @@ Target users:
 1. Download / clone this repo.
 2. Double-click `start_zimage.bat`.
 3. The first-run wizard installs missing files and saves configuration.
-4. Open the UI:
+4. Wait until the terminal says **Ready. Open this link:**.
+5. Open the UI:
    - http://127.0.0.1:9000
 
 ## Requirements
@@ -74,7 +79,7 @@ The installer will:
 - Recommend a profile automatically
 - Download required files
 - Save setup state in `config\setup_config.json`
-- Launch the Gradio UI at http://127.0.0.1:9000
+- Start the Gradio UI and print http://127.0.0.1:9000 only after the page is reachable
 
 After setup is complete, future launches start the app directly.
 
@@ -193,6 +198,27 @@ The UI includes a **Low VRAM Mode** section:
 
 The app also saves a metadata `.txt` file next to each generated image, including the prompt, seed, command, selected LoRAs, and timing. The UI shows the last command and a recent output gallery for easier testing.
 
+## Generation queue
+
+The app now uses a background generation queue. This means you can:
+
+1. Start a generation.
+2. Change the prompt, seed, LoRA, size, or other settings.
+3. Click **Generate** again while the first image is still running.
+4. The new request is added to the queue and starts automatically when the current job finishes.
+
+The **Generation Queue** table shows each job status:
+
+- `queued` means waiting for its turn.
+- `running` means stable-diffusion.cpp is currently generating it.
+- `done` means the image finished successfully.
+- `failed` means the job hit an error.
+- `stopping` / `stopped` means the stop button was used.
+
+The queue runs one job at a time to protect low-VRAM GPUs. It is managed by the local Python app, not by the browser tab, so refreshing the page should not stop the backend queue. The UI polls the backend state and restores the queue table after a reload.
+
+Use **Clear Finished Queue Items** to remove completed, failed, or stopped rows from the table. It does not delete generated images.
+
 ## LoRA support
 
 The setup now automatically creates this folder:
@@ -223,11 +249,15 @@ To try it:
 1. Enable img2img in the tab.
 2. Write the img2img prompt in that tab.
 3. Upload an input image.
-4. Set img2img steps, guidance, and strength:
+4. Choose the img2img output size:
+   - Keep **Auto match uploaded image aspect ratio** enabled for the easiest workflow.
+   - A 16:9 upload will automatically select a 16:9 output preset, a portrait upload will select a portrait preset, and a square upload will stay square.
+   - You can turn auto mode off and manually choose the img2img resolution preset, width, and height.
+5. Set img2img steps, guidance, and strength:
    - `0.30-0.45` preserves strongly and may show little change.
    - `0.50-0.60` is a better practical range for visible Z-Image Turbo edits.
    - `0.65+` can drift heavily or become a new image.
-5. Generate as usual.
+6. Generate as usual.
 
 For small edits such as color changes, use the negative prompt to block unwanted scene changes such as `tree`, `branch`, or `outdoor`. The app copies and resizes the uploaded image into a local temp folder before generation so the backend can read it reliably. Img2img support depends on the installed stable-diffusion.cpp build and Z-Image Turbo GGUF behavior, so it is labeled experimental.
 
@@ -252,19 +282,23 @@ This is experimental with Z-Image Turbo. The backend accepts the mask path, but 
 
 ## What the installer downloads (and what is manual)
 
-Automatic (safe, non-executable downloads):
+Automatic during beginner setup:
 
 - Z-Image Turbo GGUF (diffusion model)
+- VAE: `models\vae\ae.safetensors`
 - Qwen GGUF (LLM/text encoder)
+- Recommended stable-diffusion.cpp backend files when missing:
+  - Current NVIDIA build: `sd-cli.exe`, `sd-server.exe`, `stable-diffusion.dll`
+  - CUDA runtime DLLs from `cudart-sd-bin-win-cu12-x64.zip`
+  - CPU build files when using the CPU profile
 
-Manual:
+Manual / advanced override:
 
 - stable-diffusion.cpp backend files:
   - Current NVIDIA build: `sd-cli.exe`, `sd-server.exe`, `stable-diffusion.dll`
   - CUDA runtime DLLs from `cudart-sd-bin-win-cu12-x64.zip`
   - Legacy builds: `sd.exe`
-- VAE: `models\vae\ae.safetensors`
-  - The installer now downloads this automatically from the Z-Image Turbo VAE mirror.
+- Any model file you want to replace or pin manually
 
 Manual download sources:
 
@@ -276,6 +310,19 @@ Manual download sources:
   - https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/tree/main
 
 ## Troubleshooting
+
+If the browser says "This site can't be reached":
+
+- Wait for the terminal to print **Ready. Open this link:** before opening the URL.
+- The launcher starts Gradio first, checks the local page, and only then prints the ready URL.
+- If the ready message never appears, close the terminal and run `start_zimage.bat` again.
+
+If the queue table looks outdated:
+
+- The UI refreshes queue status from the local backend every second.
+- Reloading the browser tab should restore the queue table without stopping the backend queue.
+- If a job fails, check the **Status / Logs** box and the `.txt` metadata file next to the output image.
+- Use **Clear Finished Queue Items** only to clean completed/failed/stopped rows.
 
 If generation fails or the executable crashes:
 

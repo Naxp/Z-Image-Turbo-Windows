@@ -131,6 +131,37 @@ def apply_preset(preset_label):
     return gr.update(), gr.update()
 
 
+def choose_preset_for_image(image_path, current_width=512, current_height=512):
+    if not image_path:
+        return gr.update(), gr.update(), gr.update()
+    try:
+        with Image.open(image_path) as image:
+            source_width, source_height = image.size
+    except (OSError, TypeError, ValueError):
+        return gr.update(), gr.update(), gr.update()
+
+    if source_width <= 0 or source_height <= 0:
+        return gr.update(), gr.update(), gr.update()
+
+    source_ratio = source_width / source_height
+    target_area = safe_int(current_width, 512) * safe_int(current_height, 512)
+
+    def preset_score(preset):
+        _, preset_width, preset_height = preset
+        ratio_error = abs((preset_width / preset_height) - source_ratio)
+        area_error = abs((preset_width * preset_height) - target_area) / max(target_area, 1)
+        return ratio_error, area_error
+
+    name, width_value, height_value = min(RES_PRESETS, key=preset_score)
+    return name, width_value, height_value
+
+
+def sync_img2img_size(image_path, auto_size, current_width, current_height):
+    if not auto_size:
+        return gr.update(), gr.update(), gr.update()
+    return choose_preset_for_image(image_path, current_width, current_height)
+
+
 def random_seed():
     return random.randint(0, 2_147_483_647)
 
@@ -811,6 +842,20 @@ with gr.Blocks() as demo:
                         type="filepath",
                         interactive=False,
                     )
+                    with gr.Group():
+                        gr.Markdown("### Img2Img Output Size")
+                        img2img_auto_size = gr.Checkbox(
+                            value=True,
+                            label="Auto match uploaded image aspect ratio",
+                        )
+                        img2img_preset = gr.Dropdown(
+                            [n for n, _, _ in RES_PRESETS],
+                            value="1:1 (512x512)",
+                            label="Img2Img Resolution Preset",
+                        )
+                        with gr.Row():
+                            img2img_width = gr.Dropdown(SIZE_OPTIONS, value=512, label="Img2Img Width")
+                            img2img_height = gr.Dropdown(SIZE_OPTIONS, value=512, label="Img2Img Height")
                     with gr.Row():
                         img2img_seed = gr.Number(value=-1, precision=0, label="Img2Img Seed (-1 = random)")
                     with gr.Row():
@@ -935,6 +980,21 @@ with gr.Blocks() as demo:
     refresh_gallery_btn.click(refresh_gallery, outputs=[gallery])
     unlock.change(set_unlocked, inputs=[unlock], outputs=[vae_path, llm_path])
     img2img_enabled.change(set_img2img_enabled, inputs=[img2img_enabled], outputs=[init_image, img2img_strength])
+    img2img_preset.change(apply_preset, inputs=[img2img_preset], outputs=[img2img_width, img2img_height])
+    init_image.change(
+        sync_img2img_size,
+        inputs=[init_image, img2img_auto_size, img2img_width, img2img_height],
+        outputs=[img2img_preset, img2img_width, img2img_height],
+        queue=False,
+        show_progress="hidden",
+    )
+    img2img_auto_size.change(
+        sync_img2img_size,
+        inputs=[init_image, img2img_auto_size, img2img_width, img2img_height],
+        outputs=[img2img_preset, img2img_width, img2img_height],
+        queue=False,
+        show_progress="hidden",
+    )
     inpaint_enabled.change(set_inpaint_enabled, inputs=[inpaint_enabled], outputs=[inpaint_editor, inpaint_strength])
     state_outputs = [queue_table, img, status, timer_display, command_box, gallery]
     demo.load(poll_ui_state, outputs=state_outputs, queue=False, show_progress="hidden")
@@ -959,6 +1019,8 @@ with gr.Blocks() as demo:
         use_balanced_vae_tiling,
         use_img2img,
         input_image,
+        image_width,
+        image_height,
         image_negative_prompt,
         image_seed,
         image_steps,
@@ -983,6 +1045,13 @@ with gr.Blocks() as demo:
             run_seed = normalize_seed(txt_seed)
             active_prompt = txt_prompt
 
+        if generation_mode == "img2img":
+            job_width = safe_int(image_width, safe_int(w, 512))
+            job_height = safe_int(image_height, safe_int(h, 512))
+        else:
+            job_width = safe_int(w, 512)
+            job_height = safe_int(h, 512)
+
         job = {
             "id": uuid.uuid4().hex,
             "mode": generation_mode,
@@ -991,8 +1060,8 @@ with gr.Blocks() as demo:
             "txt_prompt": txt_prompt,
             "image_prompt": image_prompt,
             "selective_prompt": selective_prompt,
-            "width": safe_int(w, 512),
-            "height": safe_int(h, 512),
+            "width": job_width,
+            "height": job_height,
             "steps": safe_int(st, 8),
             "txt_seed": txt_seed,
             "image_seed": image_seed,
@@ -1050,6 +1119,8 @@ with gr.Blocks() as demo:
             balanced_vae_tiling,
             img2img_enabled,
             init_image,
+            img2img_width,
+            img2img_height,
             img2img_negative_prompt,
             img2img_seed,
             img2img_steps,
