@@ -1,6 +1,7 @@
 import os
 import random
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -32,6 +33,16 @@ LORA_DIR.mkdir(exist_ok=True)
 TEMP_INPUT_DIR.mkdir(exist_ok=True)
 
 current_proc = None
+current_job_id = None
+generation_jobs = []
+generation_lock = threading.RLock()
+worker_lock = threading.Lock()
+generation_worker_thread = None
+stop_requested = False
+latest_image = None
+latest_status = "Ready."
+latest_time = "Generation Time: **0s**"
+latest_command = ""
 FIRST_RUN = True
 LAST_SEED = None
 LAST_IMG2IMG_SEED = None
@@ -150,6 +161,80 @@ def refresh_gallery():
     return get_recent_outputs()
 
 
+def short_prompt(prompt, limit=70):
+    text = " ".join((prompt or "").split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 3]}..."
+
+
+def queue_table_rows():
+    with generation_lock:
+        rows = []
+        for index, job in enumerate(generation_jobs, start=1):
+            rows.append(
+                [
+                    index,
+                    job["mode"],
+                    short_prompt(job["prompt"]),
+                    job["seed"],
+                    job["status"],
+                ]
+            )
+        return rows
+
+
+def set_latest_state(image=None, status=None, time_text=None, command=None):
+    global latest_image, latest_status, latest_time, latest_command
+    with generation_lock:
+        if image is not None:
+            latest_image = image
+        if status is not None:
+            latest_status = status
+        if time_text is not None:
+            latest_time = time_text
+        if command is not None:
+            latest_command = command
+
+
+def poll_ui_state():
+    with generation_lock:
+        image = latest_image if latest_image else gr.update()
+        status_text = latest_status
+        time_text = latest_time
+        command_text = latest_command
+    return queue_table_rows(), image, status_text, time_text, command_text, get_recent_outputs()
+
+
+def next_queued_job():
+    global current_job_id, stop_requested
+    with generation_lock:
+        for job in generation_jobs:
+            if job["status"] == "queued":
+                job["status"] = "running"
+                current_job_id = job["id"]
+                stop_requested = False
+                return job
+    return None
+
+
+def update_job_status(job_id, status):
+    global current_job_id
+    with generation_lock:
+        for job in generation_jobs:
+            if job["id"] == job_id:
+                job["status"] = status
+                break
+        if current_job_id == job_id and status in {"done", "failed", "stopped"}:
+            current_job_id = None
+
+
+def clear_waiting_jobs():
+    with generation_lock:
+        generation_jobs[:] = [job for job in generation_jobs if job["status"] not in {"done", "failed", "stopped"}]
+    return queue_table_rows()
+
+
 def apply_example(prompt_map, selected_label):
     if selected_label in prompt_map:
         return prompt_map[selected_label]
@@ -181,15 +266,18 @@ def set_inpaint_enabled(enabled):
 
 
 def stop_gen():
-    global current_proc
+    global current_proc, stop_requested
+    stop_requested = True
+    if current_job_id:
+        update_job_status(current_job_id, "stopping")
     if current_proc and current_proc.poll() is None:
         print("Stopping generation...")
         if os.name == "nt":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(current_proc.pid)], capture_output=True)
         else:
             current_proc.terminate()
-        return "Generation stopped by user."
-    return "No active generation to stop."
+        return "Generation stopped by user.", queue_table_rows()
+    return "No active generation to stop.", queue_table_rows()
 
 
 def normalize_seed(seed_value):
@@ -200,6 +288,153 @@ def normalize_seed(seed_value):
     if seed_int < 0:
         return random_seed()
     return seed_int
+
+
+def seed_field_update(seed_value, run_seed):
+    try:
+        if int(seed_value) >= 0:
+            return run_seed
+    except (TypeError, ValueError):
+        pass
+    return gr.update()
+
+
+def safe_int(value, fallback):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def safe_float(value, fallback):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def run_generation_job(job):
+    global FIRST_RUN, LAST_SEED, LAST_IMG2IMG_SEED, LAST_INPAINT_SEED, stop_requested
+
+    generation_mode = job["mode"]
+    if generation_mode == "inpaint":
+        LAST_INPAINT_SEED = job["seed"]
+        active_prompt = job["selective_prompt"]
+        active_steps = job["selective_steps"]
+        active_negative_prompt = job["selective_negative_prompt"]
+        active_guidance = job["selective_guidance"]
+        active_strength = job["selective_strength"]
+        active_init_image, active_mask, prep_error = prepare_inpaint_images(
+            job["inpaint_image"],
+            job["width"],
+            job["height"],
+        )
+        if prep_error:
+            update_job_status(job["id"], "failed")
+            set_latest_state(status=prep_error, time_text="Generation Time: **0s**")
+            return
+    elif generation_mode == "img2img":
+        LAST_IMG2IMG_SEED = job["seed"]
+        active_prompt = job["image_prompt"]
+        active_steps = job["image_steps"]
+        active_negative_prompt = job["image_negative_prompt"]
+        active_guidance = job["image_guidance"]
+        active_strength = job["image_strength"]
+        active_init_image = job["input_image"]
+        active_mask = None
+    else:
+        LAST_SEED = job["seed"]
+        active_prompt = job["txt_prompt"]
+        active_steps = job["steps"]
+        active_negative_prompt = ""
+        active_guidance = 3.5
+        active_strength = 0.55
+        active_init_image = None
+        active_mask = None
+
+    status_msg = "Generating... (first run can take longer)" if FIRST_RUN else "Generating..."
+    FIRST_RUN = False
+    set_latest_state(status=status_msg, time_text="Generation Time: **0s**")
+
+    last_img = None
+    last_log = ""
+    last_time = "0s"
+    last_command = ""
+    try:
+        for out_img, log, time_str, cmd_str in gen_image(
+            active_prompt,
+            job["width"],
+            job["height"],
+            active_steps,
+            job["seed"],
+            job["cfg_scale"],
+            job["vae_path"],
+            job["llm_path"],
+            job["selected_loras"],
+            job["lora_strength"],
+            job["lora_apply_mode"],
+            job["vram_mode"],
+            job["clip_on_cpu"],
+            job["balanced_vae_tiling"],
+            active_negative_prompt,
+            active_guidance,
+            generation_mode != "txt2img",
+            active_init_image,
+            active_strength,
+            active_mask,
+            generation_mode,
+        ):
+            if out_img is not None:
+                last_img = out_img
+            last_log = log or ""
+            last_time = time_str or "0s"
+            last_command = cmd_str or ""
+            set_latest_state(
+                image=out_img,
+                status=last_log,
+                time_text=f"Generation Time: **{last_time}**",
+                command=last_command,
+            )
+    except Exception as exc:
+        update_job_status(job["id"], "failed")
+        set_latest_state(status=f"Generation failed unexpectedly: {exc}")
+        return
+
+    if stop_requested or "Generation stopped" in last_log:
+        update_job_status(job["id"], "stopped")
+        stop_requested = False
+    elif last_img is not None:
+        update_job_status(job["id"], "done")
+    else:
+        update_job_status(job["id"], "failed")
+
+    final_image = last_img if last_img is not None else None
+    set_latest_state(
+        image=final_image,
+        status=last_log,
+        time_text=f"Generation Time: **{last_time}**",
+        command=last_command,
+    )
+
+
+def queue_worker():
+    while True:
+        job = next_queued_job()
+        if not job:
+            time.sleep(0.5)
+            job = next_queued_job()
+            if not job:
+                return
+        run_generation_job(job)
+
+
+def ensure_generation_worker():
+    global generation_worker_thread
+    with worker_lock:
+        if generation_worker_thread and generation_worker_thread.is_alive():
+            return
+        generation_worker_thread = threading.Thread(target=queue_worker, daemon=True)
+        generation_worker_thread.start()
 
 
 def append_lora_tags(prompt, selected_loras, lora_strength):
@@ -401,15 +636,19 @@ def gen_image(
     yield None, f"Starting generation...\nCommand: {cmd_str}", "0s", cmd_str
 
     t_start = time.perf_counter()
-    current_proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-    )
+    try:
+        current_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
+    except OSError as exc:
+        yield None, f"Could not start stable-diffusion.cpp backend: {exc}", "0s", cmd_str
+        return
 
     full_log = ""
     try:
@@ -473,6 +712,7 @@ def gen_image(
 
 with gr.Blocks() as demo:
     gr.Markdown("# Z-Image Turbo - Low VRAM UI")
+    queue_refresh_timer = gr.Timer(1.0)
 
     with gr.Row():
         with gr.Column(scale=3):
@@ -669,6 +909,16 @@ with gr.Blocks() as demo:
             gallery = gr.Gallery(label="Recent Outputs", value=get_recent_outputs(), columns=3, height=260)
             refresh_gallery_btn = gr.Button("Refresh Gallery", variant="secondary")
             command_box = gr.Textbox(label="Last Command", interactive=False, lines=3)
+            queue_table = gr.Dataframe(
+                headers=["#", "Mode", "Prompt", "Seed", "Status"],
+                value=queue_table_rows(),
+                datatype=["number", "str", "str", "number", "str"],
+                interactive=False,
+                label="Generation Queue",
+                row_count=(4, "dynamic"),
+                column_count=(5, "fixed"),
+            )
+            clear_queue_btn = gr.Button("Clear Finished Queue Items", variant="secondary")
             status = gr.Textbox(label="Status / Logs", interactive=False, lines=14)
 
     preset.change(apply_preset, inputs=[preset], outputs=[width, height])
@@ -686,8 +936,11 @@ with gr.Blocks() as demo:
     unlock.change(set_unlocked, inputs=[unlock], outputs=[vae_path, llm_path])
     img2img_enabled.change(set_img2img_enabled, inputs=[img2img_enabled], outputs=[init_image, img2img_strength])
     inpaint_enabled.change(set_inpaint_enabled, inputs=[inpaint_enabled], outputs=[inpaint_editor, inpaint_strength])
+    state_outputs = [queue_table, img, status, timer_display, command_box, gallery]
+    demo.load(poll_ui_state, outputs=state_outputs, queue=False, show_progress="hidden")
+    queue_refresh_timer.tick(poll_ui_state, outputs=state_outputs, queue=False, show_progress="hidden")
 
-    def run_and_return(
+    def add_generation_job(
         txt_prompt,
         image_prompt,
         selective_prompt,
@@ -719,116 +972,65 @@ with gr.Blocks() as demo:
         selective_guidance,
         selective_strength,
     ):
-        global FIRST_RUN, LAST_SEED, LAST_IMG2IMG_SEED, LAST_INPAINT_SEED
-
         generation_mode = "inpaint" if use_inpaint else "img2img" if use_img2img else "txt2img"
         if generation_mode == "inpaint":
             run_seed = normalize_seed(selective_seed)
-            LAST_INPAINT_SEED = run_seed
-            seed_outputs = (gr.update(), gr.update(), run_seed)
+            active_prompt = selective_prompt
         elif generation_mode == "img2img":
             run_seed = normalize_seed(image_seed)
-            LAST_IMG2IMG_SEED = run_seed
-            seed_outputs = (gr.update(), run_seed, gr.update())
+            active_prompt = image_prompt
         else:
             run_seed = normalize_seed(txt_seed)
-            LAST_SEED = run_seed
-            seed_outputs = (run_seed, gr.update(), gr.update())
+            active_prompt = txt_prompt
 
-        status_msg = "Generating... (first run can take longer)" if FIRST_RUN else "Generating..."
-        FIRST_RUN = False
-        active_prompt = selective_prompt if generation_mode == "inpaint" else image_prompt if generation_mode == "img2img" else txt_prompt
-        active_steps = int(selective_steps) if generation_mode == "inpaint" else int(image_steps) if generation_mode == "img2img" else int(st)
-        active_negative_prompt = selective_negative_prompt if generation_mode == "inpaint" else image_negative_prompt if generation_mode == "img2img" else ""
-        active_guidance = float(selective_guidance) if generation_mode == "inpaint" else float(image_guidance) if generation_mode == "img2img" else 3.5
-        active_strength = float(selective_strength) if generation_mode == "inpaint" else float(image_strength)
-        active_init_image = input_image
-        active_mask = None
-        prep_error = None
-        if generation_mode == "inpaint":
-            active_init_image, active_mask, prep_error = prepare_inpaint_images(inpaint_image, int(w), int(h))
-            if prep_error:
-                yield (
-                    None,
-                    prep_error,
-                    gr.update(interactive=True),
-                    gr.update(interactive=False),
-                    "Generation Time: **0s**",
-                    "",
-                    get_recent_outputs(),
-                    *seed_outputs,
-                )
-                return
-
-        yield (
-            None,
-            status_msg,
-            gr.update(interactive=False),
-            gr.update(interactive=True),
-            "Generation Time: **0s**",
-            "",
-            get_recent_outputs(),
-            *seed_outputs,
+        job = {
+            "id": uuid.uuid4().hex,
+            "mode": generation_mode,
+            "status": "queued",
+            "prompt": active_prompt,
+            "txt_prompt": txt_prompt,
+            "image_prompt": image_prompt,
+            "selective_prompt": selective_prompt,
+            "width": safe_int(w, 512),
+            "height": safe_int(h, 512),
+            "steps": safe_int(st, 8),
+            "txt_seed": txt_seed,
+            "image_seed": image_seed,
+            "selective_seed": selective_seed,
+            "seed": run_seed,
+            "cfg_scale": safe_float(cfg, 1.0),
+            "vae_path": vae,
+            "llm_path": llm,
+            "selected_loras": list(l_list or []),
+            "lora_strength": safe_float(l_str, 1.0),
+            "lora_apply_mode": l_apply_mode,
+            "vram_mode": low_vram_mode,
+            "clip_on_cpu": bool(keep_clip_cpu),
+            "balanced_vae_tiling": bool(use_balanced_vae_tiling),
+            "input_image": input_image,
+            "image_negative_prompt": image_negative_prompt,
+            "image_steps": safe_int(image_steps, 12),
+            "image_guidance": safe_float(image_guidance, 3.5),
+            "image_strength": safe_float(image_strength, 0.55),
+            "inpaint_image": inpaint_image,
+            "selective_negative_prompt": selective_negative_prompt,
+            "selective_steps": safe_int(selective_steps, 12),
+            "selective_guidance": safe_float(selective_guidance, 4.0),
+            "selective_strength": safe_float(selective_strength, 0.75),
+        }
+        with generation_lock:
+            generation_jobs.append(job)
+            queued_count = sum(1 for item in generation_jobs if item["status"] == "queued")
+            running_count = sum(1 for item in generation_jobs if item["status"] == "running")
+        message = (
+            f"Added to queue: {generation_mode}. "
+            f"Running: {running_count} | Waiting: {queued_count}"
         )
-
-        last_img = None
-        last_log = ""
-        last_time = "0s"
-        last_command = ""
-        for out_img, log, time_str, cmd_str in gen_image(
-            active_prompt,
-            int(w),
-            int(h),
-            active_steps,
-            run_seed,
-            float(cfg),
-            vae,
-            llm,
-            l_list,
-            l_str,
-            l_apply_mode,
-            low_vram_mode,
-            keep_clip_cpu,
-            use_balanced_vae_tiling,
-            active_negative_prompt,
-            active_guidance,
-            generation_mode != "txt2img",
-            active_init_image,
-            active_strength,
-            active_mask,
-            generation_mode,
-        ):
-            if out_img is not None:
-                last_img = out_img
-            last_log = log
-            last_time = time_str
-            last_command = cmd_str
-            image_update = out_img if out_img is not None else gr.update()
-            yield (
-                image_update,
-                log,
-                gr.update(interactive=False),
-                gr.update(interactive=True),
-                f"Generation Time: **{time_str}**",
-                cmd_str,
-                get_recent_outputs(),
-                *seed_outputs,
-            )
-
-        final_image = last_img if last_img is not None else gr.update()
-        yield (
-            final_image,
-            last_log,
-            gr.update(interactive=True),
-            gr.update(interactive=False),
-            f"Generation Time: **{last_time}**",
-            last_command,
-            get_recent_outputs(),
-            *seed_outputs,
-        )
+        ensure_generation_worker()
+        return queue_table_rows(), message
 
     btn.click(
-        run_and_return,
+        add_generation_job,
         inputs=[
             txt2img_prompt,
             img2img_prompt,
@@ -861,20 +1063,19 @@ with gr.Blocks() as demo:
             inpaint_guidance,
             inpaint_strength,
         ],
-        outputs=[
-            img,
-            status,
-            btn,
-            stop_btn,
-            timer_display,
-            command_box,
-            gallery,
-            seed,
-            img2img_seed,
-            inpaint_seed,
-        ],
+        outputs=[queue_table, status],
+        queue=False,
+        trigger_mode="multiple",
+        show_progress="hidden",
     )
-    stop_btn.click(stop_gen, outputs=[status])
+    clear_queue_btn.click(clear_waiting_jobs, outputs=[queue_table], queue=False, show_progress="hidden")
+    stop_btn.click(stop_gen, outputs=[status, queue_table], queue=False, show_progress="hidden")
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=9000, share=False)
+    demo.queue(default_concurrency_limit=1)
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=9000,
+        share=False,
+        quiet=os.environ.get("ZIMAGE_QUIET_LAUNCH") == "1",
+    )

@@ -514,6 +514,29 @@ function Run-SetupWizard {
     return [pscustomobject]$config
 }
 
+function Wait-ForUiReady {
+    param(
+        [string]$Url,
+        [System.Diagnostics.Process]$Process,
+        [int]$TimeoutSeconds = 180
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ($Process.HasExited) {
+            throw "The UI closed before it was ready. Please check the messages above for the error."
+        }
+        try {
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                return
+            }
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    throw "The UI did not become ready within $TimeoutSeconds seconds. Try running start_zimage.bat again."
+}
+
 function Launch-App {
     param(
         [object]$Config,
@@ -544,8 +567,22 @@ function Launch-App {
     Write-Host "Launching Z-Image Turbo UI..."
     Write-Host ("Profile: {0}" -f $Config.profile_id)
     Write-Host ("Model  : {0}" -f $model.filename)
-    Write-Host "URL    : http://127.0.0.1:9000"
-    & $venvPython $uiScript
+    Write-Host "Starting local server. The ready link will appear in a moment..."
+
+    $launchUrl = "http://127.0.0.1:9000"
+    $env:ZIMAGE_QUIET_LAUNCH = "1"
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $venvPython
+    $startInfo.Arguments = "`"$uiScript`""
+    $startInfo.WorkingDirectory = $root
+    $startInfo.UseShellExecute = $false
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+
+    Wait-ForUiReady -Url $launchUrl -Process $process
+    Write-Host ""
+    Write-Host "Ready. Open this link:"
+    Write-Host ("URL    : {0}" -f $launchUrl)
+    $process.WaitForExit()
 }
 
 Ensure-ProjectFolders
